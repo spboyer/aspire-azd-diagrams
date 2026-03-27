@@ -101,17 +101,17 @@ flowchart TB
 
 <!-- ───────────────────────────────────────────────────── -->
 <h2>Diagram 2: Proposed State — One Deployment Engine</h2>
-<p class="note">All Azure deployment goes through <code>azd aspire deploy</code>. Aspire hints users to the extension. No parallel paths.</p>
+<p class="note">Both commands run the same engine. Aspire CLI install auto-installs the azd extension if azd is present.</p>
 
 <div class="diagram-container">
 <pre class="mermaid">
 flowchart TB
-    subgraph ENTRY["User Entry Points"]
-        EP_A["🟣 aspire deploy --target azure<br/><i>Prints: Install azd aspire extension<br/>Run: azd aspire deploy</i>"]
-        EP_B["🔵 azd aspire deploy<br/><i>THE deployment command</i>"]
+    subgraph ENTRY["Both commands → same engine"]
+        EP_A["🟣 aspire deploy<br/><i>Delegates to azd aspire extension<br/>Extension auto-installed with Aspire CLI</i>"]
+        EP_B["🔵 azd aspire deploy<br/><i>Direct invocation</i>"]
     end
 
-    EP_A -.->|"Hint — user runs azd"| EP_B
+    EP_A -->|"Invokes same engine"| EXT
     EP_B -->|"Direct invocation"| EXT
 
     subgraph EXT["🟢 azd aspire extension (azure.aspire)<br/>~6,745 LOC — Aspire-unique logic"]
@@ -144,12 +144,11 @@ flowchart TB
     style CORE fill:#1c2a3a,stroke:#58a6ff,stroke-width:1px
     style ENTRY fill:#1e1e3f,stroke:#8b5cf6,stroke-width:1px
     style AZURE2 fill:#0c2d48,stroke:#58a6ff,stroke-width:1px
-    style EP_A fill:#2a1a2a,stroke:#8b5cf6,stroke-dasharray:5 5
 </pre>
 </div>
 <div class="legend">
   🟢 <strong>Extension owns Aspire-unique logic.</strong> Calls shared core APIs (container builds, ACA ops) via gRPC — doesn't reimplement them.<br/>
-  🟣 <strong>Aspire side: minimal change.</strong> <code>aspire deploy --target azure</code> prints install/run hint. ~10 lines of code.
+  🟣 <strong>Aspire side:</strong> <code>aspire deploy</code> delegates to the extension. Extension auto-installed when Aspire CLI is installed (if azd is present). No manual <code>azd extension install</code> needed.
 </div>
 
 <!-- ───────────────────────────────────────────────────── -->
