@@ -37,41 +37,42 @@
 <h1>Aspire ↔ azd Extension Migration — Architecture Diagrams</h1>
 
 <!-- ───────────────────────────────────────────────────── -->
-<h2>Diagram 1: Current State — Aspire Embedded in azd Core</h2>
-<p class="note">All Aspire-specific code (~7,550 LOC) lives inside azd's core packages. Tight coupling.</p>
+<h2>Diagram 1: Current State — What's Unique vs Shared</h2>
+<p class="note">Only ~6,745 LOC is truly Aspire-unique. Shared framework infrastructure (container builds, .NET framework service, ACA ops) is used by ALL frameworks — same pattern as Node, Python, Docker. (h/t Victor)</p>
 
 <div class="diagram-container">
 <pre class="mermaid">
 flowchart TB
     subgraph AppHost["🟣 .NET Aspire AppHost"]
-        AH["Program.cs<br/>AddProject, AddAzurePostgres,<br/>AddAzureRedis, etc."]
+        AH["Program.cs<br/>AddProject, AddAzurePostgres,<br/>AddAzureRedis,<br/>PublishAsAzureContainerApp,<br/>PublishAsAzureAppServiceWebsite"]
     end
 
-    AH -->|"dotnet run<br/>--publisher manifest"| MF["📄 aspire-manifest.json<br/>resources: project.v0, azure.*, etc."]
+    AH -->|"dotnet run<br/>--publisher manifest"| MF["📄 aspire-manifest.json"]
 
-    subgraph AZD_CORE["🔴 azd CORE (tightly coupled)"]
-        subgraph ASPIRE_CODE["⚠️ Aspire-Specific Code (~7,550 LOC)"]
-            MP["apphost/manifest.go<br/>Parse manifest JSON"]
-            BG["apphost/generate.go<br/>Generate Bicep (2,124 LOC)"]
-            DI["dotnet_importer.go<br/>Manifest → ServiceConfig (743 LOC)"]
-            ST["service_target_dotnet_containerapp.go<br/>Deploy to ACA (1,067 LOC)"]
-            DT["dotnet CLI wrappers<br/>Aspire detection (~500 LOC)"]
-            INIT["app_init.go<br/>AppHost detection in azd init"]
-            TMPL["resources/apphost/templates/<br/>8 Bicep/YAML template files"]
+    subgraph AZD_CORE["azd CORE"]
+        subgraph ASPIRE_UNIQUE["🔴 Aspire-UNIQUE Code (~6,745 LOC)<br/>No other framework does this"]
+            MP["apphost/manifest.go<br/>App topology manifest parsing"]
+            BG["apphost/generate.go<br/>Bicep generation FROM manifest<br/>(2,124 LOC)"]
+            EVAL["apphost/eval.go<br/>Expression evaluation<br/>{resource.property} refs"]
+            DI["dotnet_importer.go<br/>Dynamic service discovery<br/>from manifest (743 LOC)"]
+            ST["service_target_dotnet_containerapp.go<br/>Manifest-driven deploy (1,067 LOC)"]
+            INIT["app_init.go + detect_confirm_apphost.go<br/>AppHost detection in azd init"]
         end
 
-        subgraph GENERIC["✅ Generic Core"]
-            BICEP["Bicep provisioning"]
+        subgraph SHARED["✅ Shared Framework Infrastructure<br/>Used by Node, Python, Docker, .NET — NOT Aspire-specific"]
+            FSD["framework_service_dotnet.go<br/>dotnet build/publish/restore"]
+            FSDK["framework_service_docker.go<br/>Container build/publish"]
+            CH["container_helper.go<br/>Image build + push"]
+            ACA_S["pkg/containerapps/<br/>Generic ACA operations"]
+            BICEP["Bicep provisioning provider"]
             ENV["Environment management"]
             ARM["Azure SDK / ARM"]
-            ACR_CORE["Container registry ops"]
         end
 
-        MP --> BG --> DI --> ST
-        ST --> BICEP
-        ST --> ENV
-        ST --> ARM
-        ST --> ACR_CORE
+        MP --> BG
+        BG --> DI
+        DI --> ST
+        ST --> SHARED
     end
 
     MF --> MP
@@ -79,134 +80,128 @@ flowchart TB
     ST -->|"Provision + Deploy"| AZURE
 
     subgraph AZURE["☁️ Azure"]
-        RG["Resource Group"]
-        ACA_ENV["Container Apps Environment"]
-        ACR_AZ["Container Registry"]
-        PG["PostgreSQL"]
-        REDIS["Redis Cache"]
+        direction LR
+        ACA_ENV["Container Apps Env"]
+        APPSVC["App Service Plan"]
+        ACR_AZ["ACR"]
+        MANAGED["PostgreSQL, Redis,<br/>Service Bus, Key Vault,<br/>OpenAI, etc."]
     end
 
-    style ASPIRE_CODE fill:#6e1e1e,stroke:#f85149,stroke-width:2px
-    style GENERIC fill:#1a3a1a,stroke:#3fb950,stroke-width:1px
-    style AZD_CORE fill:#1c1c1c,stroke:#f85149,stroke-width:2px
+    style ASPIRE_UNIQUE fill:#6e1e1e,stroke:#f85149,stroke-width:2px
+    style SHARED fill:#1a3a1a,stroke:#3fb950,stroke-width:1px
+    style AZD_CORE fill:#1c1c1c,stroke:#484848,stroke-width:1px
     style AppHost fill:#1e1e3f,stroke:#8b5cf6,stroke-width:1px
     style AZURE fill:#0c2d48,stroke:#58a6ff,stroke-width:1px
 </pre>
 </div>
 <div class="legend">
-  🔴 <strong>Problem:</strong> The red box contains ~7,550 lines of Aspire-specific Go code embedded directly in azd core. This code should be extracted into an extension.
+  🔴 <strong>Red box = Aspire-UNIQUE</strong> — manifest parsing, Bicep generation from manifests, expression evaluation, dynamic service discovery. No other framework does this.<br/>
+  ✅ <strong>Green box = SHARED</strong> — container builds, .NET framework service, ACA ops, Bicep provisioning. Used by ALL frameworks. Stays in core.
 </div>
 
 <!-- ───────────────────────────────────────────────────── -->
-<h2>Diagram 2: Proposed State — aspire deploy → azd aspire deploy</h2>
-<p class="note">Two entry points converge on the extension. azd core stays clean.</p>
+<h2>Diagram 2: Proposed State — One Deployment Engine</h2>
+<p class="note">All Azure deployment goes through <code>azd aspire deploy</code>. Aspire hints users to the extension. No parallel paths.</p>
 
 <div class="diagram-container">
 <pre class="mermaid">
 flowchart TB
-    subgraph ENTRY["Two Entry Points"]
-        EP_A["🟣 aspire deploy<br/><i>(.NET developer)</i>"]
-        EP_B["🔵 azd aspire deploy<br/><i>(Platform engineer)</i>"]
+    subgraph ENTRY["User Entry Points"]
+        EP_A["🟣 aspire deploy --target azure<br/><i>Prints: Install azd aspire extension<br/>Run: azd aspire deploy</i>"]
+        EP_B["🔵 azd aspire deploy<br/><i>THE deployment command</i>"]
     end
 
-    EP_A -->|"1. Run publish pipeline<br/>2. Invoke azd"| EXT
+    EP_A -.->|"Hint — user runs azd"| EP_B
     EP_B -->|"Direct invocation"| EXT
 
-    subgraph EXT["🟢 azd aspire extension (azure.aspire)"]
+    subgraph EXT["🟢 azd aspire extension (azure.aspire)<br/>~6,745 LOC — Aspire-unique logic"]
         direction TB
         PARSE["📄 Manifest Parser<br/>manifest.go, eval.go"]
         GEN["🔧 Bicep Generator<br/>generate.go + templates"]
-        STP["🚀 ServiceTargetProvider<br/>Deploy to ACA"]
-        FSP["📦 FrameworkServiceProvider<br/>Build / Restore / Package"]
-        CMD["⌨️ Custom Commands<br/>init, deploy, generate,<br/>manifest, dashboard"]
-        FM["--from-manifest flag<br/><i>Key integration point</i>"]
+        STP["🚀 ServiceTargetProvider<br/>Deploy to ACA or App Service"]
+        CMD["⌨️ Custom Commands<br/>init, deploy, provision,<br/>generate, manifest, dashboard"]
     end
 
     subgraph CORE["✅ azd CORE (clean — no Aspire code)"]
         direction TB
-        EXTFW["Extension Framework<br/>(gRPC host)"]
-        BICEP2["Bicep provisioning"]
-        ENV2["Environment management"]
-        ARM2["Azure SDK / ARM"]
-        ACR2["Container registry ops"]
-        DOT["Generic dotnet CLI"]
+        EXTFW["Extension Framework (gRPC)"]
+        SHARED2["Shared: container builds,<br/>.NET framework service,<br/>ACA ops, Bicep provisioning,<br/>environment, Azure SDK"]
     end
 
-    EXT <-->|"gRPC<br/>(JWT auth)"| CORE
+    EXT <-->|"gRPC calls to<br/>shared infrastructure"| CORE
 
     CORE -->|"Provision + Deploy"| AZURE2
 
     subgraph AZURE2["☁️ Azure"]
-        RG2["Resource Group + Services"]
-        ACA2["Container Apps"]
-        ACR_AZ2["ACR"]
+        direction LR
+        ACA3["Container Apps"]
+        APPSVC2["App Service"]
+        ACR3["ACR"]
+        MANAGED2["Managed Services"]
     end
 
     style EXT fill:#1a3a1a,stroke:#3fb950,stroke-width:2px
     style CORE fill:#1c2a3a,stroke:#58a6ff,stroke-width:1px
     style ENTRY fill:#1e1e3f,stroke:#8b5cf6,stroke-width:1px
     style AZURE2 fill:#0c2d48,stroke:#58a6ff,stroke-width:1px
-    style FM fill:#3a2a0a,stroke:#d29922,stroke-width:2px
+    style EP_A fill:#2a1a2a,stroke:#8b5cf6,stroke-dasharray:5 5
 </pre>
 </div>
 <div class="legend">
-  🟢 <strong>Result:</strong> Aspire code lives in a separate extension binary. azd core has zero Aspire-specific code. <code>aspire deploy</code> delegates to <code>azd aspire deploy</code>.
+  🟢 <strong>Extension owns Aspire-unique logic.</strong> Calls shared core APIs (container builds, ACA ops) via gRPC — doesn't reimplement them.<br/>
+  🟣 <strong>Aspire side: minimal change.</strong> <code>aspire deploy --target azure</code> prints install/run hint. ~10 lines of code.
 </div>
 
 <!-- ───────────────────────────────────────────────────── -->
-<h2>Diagram 3: aspire deploy → azd aspire deploy — Data Flow</h2>
-<p class="note">Step-by-step data flow when a .NET developer runs <code>aspire deploy</code>.</p>
+<h2>Diagram 3: Data Flow — azd aspire deploy</h2>
+<p class="note">Step-by-step: user runs <code>azd aspire deploy</code>, extension generates manifest, provisions, deploys.</p>
 
 <div class="diagram-container">
 <pre class="mermaid">
 sequenceDiagram
     participant Dev as 👩‍💻 Developer
-    participant Aspire as 🟣 aspire deploy<br/>(microsoft/aspire)
-    participant Disk as 💾 Disk<br/>(/tmp/aspire-out/)
     participant AzdExt as 🟢 azd aspire deploy<br/>(extension)
-    participant AzdCore as 🔵 azd core<br/>(gRPC host)
+    participant DotNet as 🔧 dotnet CLI
+    participant AzdCore as 🔵 azd core<br/>(gRPC services)
     participant Azure as ☁️ Azure
 
-    Dev->>Aspire: aspire deploy --target azure
+    Dev->>AzdExt: azd aspire deploy
 
-    Note over Aspire: Step 1: Publish Pipeline
-    Aspire->>Aspire: publish-prereq:<br/>Generate manifest.json
-    Aspire->>Aspire: publish:<br/>Generate Bicep files<br/>(Azure.Provisioning SDK)
+    Note over AzdExt,DotNet: Step 1: Generate Manifest
+    AzdExt->>DotNet: dotnet run --publisher manifest<br/>--output-path /tmp/manifest/
+    DotNet-->>AzdExt: manifest.json + Bicep files
 
-    Note over Aspire,Disk: Step 2: Write Artifacts
-    Aspire->>Disk: manifest.json
-    Aspire->>Disk: main.bicep
-    Aspire->>Disk: *.module.bicep
-    Aspire->>Disk: *-roles.module.bicep
+    Note over AzdExt: Step 2: Parse Manifest
+    AzdExt->>AzdExt: Parse manifest.json<br/>Extract services, resources<br/>Evaluate expressions
 
-    Note over Aspire,AzdExt: Step 3: Invoke azd
-    Aspire->>AzdExt: Process.Start("azd",<br/>"aspire deploy<br/>--from-manifest /tmp/aspire-out/<br/>--output json")
+    Note over AzdExt,AzdCore: Step 3: Get Azure Context
+    AzdExt->>AzdCore: gRPC: EnvironmentService
+    AzdCore-->>AzdExt: Subscription, RG, location
+    AzdExt->>AzdCore: gRPC: AccountService
+    AzdCore-->>AzdExt: Azure credentials
 
-    Note over AzdExt,AzdCore: Step 4: Extension Work
-    AzdExt->>Disk: Read manifest.json
-    AzdExt->>Disk: Read *.bicep files
-    AzdExt->>AzdCore: gRPC: Get environment
-    AzdCore-->>AzdExt: Environment config
-    AzdExt->>AzdCore: gRPC: Get subscription
-    AzdCore-->>AzdExt: Azure subscription
-    AzdExt->>Azure: Provision resources (Bicep deploy)
-    Azure-->>AzdExt: Resource outputs
-    AzdExt->>Azure: Build + push containers to ACR
-    Azure-->>AzdExt: Image digests
-    AzdExt->>Azure: Deploy to Container Apps
+    Note over AzdExt,Azure: Step 4: Provision Infrastructure
+    AzdExt->>Azure: Deploy Bicep (ACA env OR App Service plan,<br/>PostgreSQL, Redis, Service Bus, etc.)
+    Azure-->>AzdExt: Resource outputs + endpoints
+
+    Note over AzdExt,Azure: Step 5: Build + Push Containers
+    AzdExt->>AzdCore: gRPC: ContainerService
+    AzdCore->>Azure: Build images, push to ACR
+    Azure-->>AzdCore: Image digests
+    AzdCore-->>AzdExt: Push complete
+
+    Note over AzdExt,Azure: Step 6: Deploy Services
+    AzdExt->>Azure: Deploy to Container Apps / App Service
     Azure-->>AzdExt: Deployment complete
 
-    Note over AzdExt,Aspire: Step 5: Return Results
-    AzdExt-->>Aspire: JSON: {status, resourceGroup,<br/>endpoints, dashboardUrl}
-
-    Note over Aspire,Dev: Step 6: Display Summary
-    Aspire-->>Dev: ☁️ Target: Azure<br/>📦 rg-myapp-dev<br/>🌐 https://api.myapp.dev<br/>📊 Dashboard: https://...
+    Note over AzdExt,Dev: Step 7: Report Results
+    AzdExt-->>Dev: ✅ Deployed to rg-myapp-dev<br/>🌐 https://api.myapp.dev<br/>📊 Dashboard: https://...
 </pre>
 </div>
 
 <!-- ───────────────────────────────────────────────────── -->
 <h2>Diagram 4: Extension gRPC Architecture</h2>
-<p class="note">How the extension binary communicates with azd core via gRPC.</p>
+<p class="note">Extension PROVIDES service target + framework providers. CONSUMES shared core APIs via gRPC.</p>
 
 <div class="diagram-container">
 <pre class="mermaid">
@@ -234,12 +229,12 @@ flowchart LR
         direction TB
         REG["Registration<br/>• ServiceTargetProvider<br/>• FrameworkServiceProvider<br/>• Event handlers<br/>• Ready()"]
 
-        subgraph IMPL["Implementation"]
+        subgraph IMPL["Aspire-Unique Implementation"]
             direction TB
-            MANIFEST["Manifest Parser"]
-            BICEP_GEN["Bicep Generator"]
-            DOTNET["dotnet CLI ops"]
-            CMDS["Custom commands"]
+            MANIFEST["Manifest Parser + Evaluator"]
+            BICEP_GEN["Bicep Generator (from manifest)"]
+            DOTNET["AppHost detection + manifest gen"]
+            CMDS["Commands: init, deploy,<br/>provision, generate,<br/>manifest, dashboard"]
         end
         REG --> IMPL
     end
@@ -251,7 +246,7 @@ flowchart LR
     IMPL -->|"Read/write env"| ENVS
     IMPL -->|"Query deployments"| DS
     IMPL -->|"User prompts"| PRS
-    IMPL -->|"ACR operations"| CS
+    IMPL -->|"Container build/push"| CS
     IMPL -->|"Subscription info"| AS
 
     style AZD fill:#1c2a3a,stroke:#58a6ff,stroke-width:1px
@@ -262,75 +257,69 @@ flowchart LR
 </div>
 <div class="legend">
   ⬅️ <strong>Left:</strong> APIs the extension <em>provides</em> to azd (service target, framework, events) &nbsp;&nbsp;
-  ➡️ <strong>Right:</strong> APIs the extension <em>consumes</em> from azd (project, environment, deployment, prompts)
+  ➡️ <strong>Right:</strong> APIs the extension <em>consumes</em> from azd (container builds, env, deployments — shared infrastructure)
 </div>
 
 <!-- ───────────────────────────────────────────────────── -->
-<h2>Diagram 5: Aspire Resource Model → Azure Resources</h2>
-<p class="note">How C# resource definitions flow through the manifest to become Azure resources.</p>
+<h2>Diagram 5: Multi-Target — Container Apps + App Service</h2>
+<p class="note">Aspire supports both ACA and App Service (GA since Aspire 13.2). Extension must handle both compute targets.</p>
 
 <div class="diagram-container">
 <pre class="mermaid">
 flowchart LR
-    subgraph CS["🟣 C# AppHost (Program.cs)"]
-        P1["AddProject&lt;Api&gt;('api')"]
-        P2["AddProject&lt;Web&gt;('web')"]
-        D1["AddDockerfile('worker')"]
-        DB["AddAzurePostgres('pg')<br/>.AddDatabase('mydb')"]
-        CA["AddAzureRedis('cache')"]
-        SB["AddAzureServiceBus('bus')<br/>.AddQueue('orders')"]
-        KV["AddAzureKeyVault('kv')"]
-        AI["AddAzureOpenAI('oai')<br/>.AddDeployment('gpt-4o')"]
+    subgraph CS["🟣 C# AppHost"]
+        direction TB
+        P1["AddProject - api<br/>.PublishAsAzureContainerApp()"]
+        P2["AddProject - web<br/>.PublishAsAzureAppServiceWebsite()"]
+        D1["AddDockerfile - worker"]
+        DB["AddAzurePostgres - pg"]
+        CA["AddAzureRedis - cache"]
+        SB["AddAzureServiceBus - bus"]
     end
 
-    subgraph MF["📄 Manifest JSON"]
-        M_P1["api: project.v1"]
-        M_P2["web: project.v1"]
+    subgraph MF["📄 Manifest"]
+        direction TB
+        M_P1["api: project.v1<br/>deploy → ACA"]
+        M_P2["web: project.v1<br/>deploy → App Service"]
         M_D1["worker: dockerfile.v0"]
         M_DB["pg: azure.postgres.v0"]
         M_CA["cache: azure.redis.v0"]
         M_SB["bus: azure.servicebus.v0"]
-        M_KV["kv: azure.keyvault.v0"]
-        M_AI["oai: azure.openai.v0"]
     end
 
-    subgraph AZ["☁️ Azure Resources"]
-        A_P1["Container App: api"]
-        A_P2["Container App: web"]
-        A_D1["Container App: worker"]
-        A_DB["PostgreSQL Flexible Server<br/>+ database: mydb"]
-        A_CA["Azure Cache for Redis"]
-        A_SB["Service Bus Namespace<br/>+ queue: orders"]
-        A_KV["Key Vault"]
-        A_AI["Azure OpenAI<br/>+ deployment: gpt-4o"]
-        A_ACR["ACR (container images)"]
-        A_ACA["ACA Environment"]
+    subgraph AZ["☁️ Azure"]
+        direction TB
+        subgraph COMPUTE["Compute Targets"]
+            direction LR
+            ACA_E["Container Apps Env<br/>├ api (Container App)<br/>└ worker (Container App)"]
+            APPSVC_E["App Service Plan P0V3<br/>└ web (Web App)"]
+        end
+        ACR_R["ACR — shared by both targets"]
+        MANAGED_R["PostgreSQL + Redis + Service Bus"]
     end
 
-    P1 --> M_P1 --> A_P1
-    P2 --> M_P2 --> A_P2
-    D1 --> M_D1 --> A_D1
-    DB --> M_DB --> A_DB
-    CA --> M_CA --> A_CA
-    SB --> M_SB --> A_SB
-    KV --> M_KV --> A_KV
-    AI --> M_AI --> A_AI
-
-    A_P1 -.-> A_ACR
-    A_P2 -.-> A_ACR
-    A_D1 -.-> A_ACR
-    A_P1 -.-> A_ACA
-    A_P2 -.-> A_ACA
-    A_D1 -.-> A_ACA
+    P1 --> M_P1 --> ACA_E
+    P2 --> M_P2 --> APPSVC_E
+    D1 --> M_D1 --> ACA_E
+    DB --> M_DB --> MANAGED_R
+    CA --> M_CA --> MANAGED_R
+    SB --> M_SB --> MANAGED_R
 
     style CS fill:#1e1e3f,stroke:#8b5cf6,stroke-width:1px
     style MF fill:#3a2a0a,stroke:#d29922,stroke-width:1px
     style AZ fill:#0c2d48,stroke:#58a6ff,stroke-width:1px
+    style ACA_E fill:#0c2d48,stroke:#3fb950,stroke-width:1px
+    style APPSVC_E fill:#0c2d48,stroke:#58a6ff,stroke-width:1px
+    style COMPUTE fill:#0a1a2a,stroke:#388bfd,stroke-width:1px
 </pre>
+</div>
+<div class="legend">
+  Projects can target <strong>Container Apps</strong> (<code>PublishAsAzureContainerApp</code>) or <strong>App Service</strong> (<code>PublishAsAzureAppServiceWebsite</code>) — per project, in the same AppHost.<br/>
+  App Service: GA since Aspire 13.2. Default SKU: P0V3 Premium Linux. Constraints: HTTP/HTTPS only, single target port, external endpoints only.
 </div>
 
 <!-- ───────────────────────────────────────────────────── -->
-<h2>Diagram 6: Publish Mode Comparison — fullAzd vs fullAspire</h2>
+<h2>Diagram 6: Publish Mode — fullAzd vs fullAspire</h2>
 <p class="note">The extension must handle both paths. fullAspire is the future direction.</p>
 
 <div class="diagram-container">
